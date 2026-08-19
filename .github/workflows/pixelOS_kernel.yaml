@@ -1,0 +1,285 @@
+# =====================================================================
+#  PixelOS (marble / Poco F5 / Redmi Note 12 Turbo) GKI Kernel + KernelSU/ReSukiSU
+#
+#  This is the CORRECT GKI route. The stock PixelOS kernel is a pure Google GKI
+#  build (5.10.252-gki-... / nobody@android-build), NOT the LineageOS vendor
+#  kernel tree. So we build the generic GKI kernel from kernel/common and
+#  integrate KernelSU/ReSukiSU into it.
+#
+#  Key facts (verified):
+#    - Stock boot kernel   : 5.10.252-gki-gf3f02401fb28 (GKI android12-5.10-2026-04)
+#    - Stock vendor_boot   : 14 DTBs (6,687,442 B)  <-- MUST stay untouched
+#    - vendor_dlkm         : fingerprint (goodix_3626) + other vendor modules
+#    - boot partition      : hdr v4, kernel + generic ramdisk (no DTB)
+#
+#  So the ONLY thing we replace is the kernel inside the `boot` partition.
+#  We do NOT touch vendor_boot (DTBs) nor vendor_dlkm (vendor modules):
+#  they stay stock and therefore stay perfectly matched with the kernel.
+#
+#  Sources:
+#    - Kernel : android.googlesource.com/kernel/common  branch android12-5.10
+#               pinned to tag android12-5.10-2026-04 (= 5.10.252, matches stock)
+#    - Root   : kernelsu | kernelsu-next | resukisu (ReSukiSU has built-in SUSFS)
+#    - SUSFS  : external simonpunk susfs4ksu (gki-android12-5.10) for kernelsu-next
+#    - Build  : gki_defconfig + plain make (pure GKI, no vendor fragments, no dtb)
+#
+#  Output: raw GKI kernel Image (5.10.252 + KernelSU/ReSukiSU). Flash it by
+#  replacing the kernel in the stock boot.img with magiskboot (vendor_boot/dtbo
+#  stay untouched), or use any kernel flasher that only swaps boot's kernel.
+# =====================================================================
+name: build PixelOS GKI kernel (KernelSU/ReSukiSU)
+
+on:
+  workflow_dispatch:
+    inputs:
+      manager:
+        description: 'Root manager built into the kernel'
+        type: choice
+        default: 'kernelsu-next'
+        options:
+          - 'kernelsu'        # tiann/KernelSU
+          - 'kernelsu-next'   # rifsxd/KernelSU-Next (external Simonpunk SUSFS)
+          - 'resukisu'        # ReSukiSU/ReSukiSU (built-in SUSFS)
+      enable_susfs:
+        description: 'Enable SUSFS (optional; kernelsu-next: external Simonpunk; resukisu: built-in; kernelsu: ignored)'
+        type: boolean
+        default: false
+      lto:
+        description: 'LTO mode (thin recommended on free runners)'
+        type: choice
+        default: 'thin'
+        options:
+          - 'none'
+          - 'thin'
+          - 'full'
+
+concurrency:
+  group: pixelos-gki-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      KERNEL_DIR: kernel_workspace
+      OUT_DIR: out
+      JOBS: '2'   # keep low to avoid OOM on free runners
+      # Stock PixelOS kernel = GKI android12-5.10-2026-04_r1 = 5.10.252
+      # (verified: SUBLEVEL=252 on tag android12-5.10-2026-04_r1)
+      GKI_BRANCH: android12-5.10
+      GKI_TAG: android12-5.10-2026-04_r1
+      GKI_VERSION: 5.10.252
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost || true
+
+      - name: Setup swap (needed for LTO)
+        if: ${{ inputs.lto != 'none' }}
+        uses: pierotofy/set-swap-space@v1.0
+        with:
+          swap-size-gb: 16
+
+      - name: Install dependencies (cached)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: >-
+            bc bison build-essential cpio curl flex git kmod
+            libelf-dev libncurses-dev libssl-dev file pahole
+            python3 python-is-python3 rsync unzip zip zstd xz-utils
+          version: 1.0
+
+      - name: Install legacy ncurses5 (needed by Android prebuilt clang)
+        run: |
+          # Android's prebuilt clang.real links libncurses.so.5, which Ubuntu
+          # 24.04 no longer ships (only libncurses6). Grab the jammy (22.04)
+          # debs from the archive and install them.
+          cd /tmp
+          wget -q https://archive.ubuntu.com/ubuntu/pool/universe/n/ncurses/libtinfo5_6.3-2ubuntu0.2_amd64.deb
+          wget -q https://archive.ubuntu.com/ubuntu/pool/universe/n/ncurses/libncurses5_6.3-2ubuntu0.2_amd64.deb
+          test -f libtinfo5_*.deb && test -f libncurses5_*.deb || {
+            echo "::error::failed to download ncurses5 debs"; exit 1; }
+          sudo dpkg -i libtinfo5_*.deb libncurses5_*.deb
+          sudo apt-get install -f -y
+          ls -l /usr/lib/x86_64-linux-gnu/libncurses.so.5* /usr/lib/x86_64-linux-gnu/libtinfo.so.5*
+
+      - name: Fetch official Android prebuilt clang (complete toolchain)
+        run: |
+          # The android12-5.10 kernel manifest pins a legacy clang-3289846 whose
+          # bin/ lacks ld.lld / llvm-ar / llvm-nm, so `make LLVM=1` fails with
+          # "linker 'ld.lld' not found". Download the latest official prebuilt
+          # clang from the Android platform prebuilts repo (main branch carries
+          # a complete toolchain incl. ld.lld, llvm-ar, llvm-nm, ...).
+          CLANG_VER=clang-r547379
+          curl -fL --retry 3 \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VER}.tar.gz" \
+            -o /tmp/clang.tar.gz
+          mkdir -p clang
+          tar -xzf /tmp/clang.tar.gz -C clang
+          test -x clang/bin/clang && test -x clang/bin/ld.lld || {
+            echo "::error::downloaded clang toolchain is incomplete (missing clang/ld.lld)"
+            exit 1
+          }
+          echo "CLANG_BIN=$(pwd)/clang/bin" >> "${GITHUB_ENV}"
+          "$(pwd)/clang/bin/clang" --version
+          ls clang/bin/ld.lld clang/bin/llvm-ar clang/bin/llvm-nm 2>/dev/null
+
+      - name: Clone GKI kernel (kernel/common, pinned to 5.10.252)
+        run: |
+          # Primary tag android12-5.10-2026-04_r1 (= 5.10.252, verified). Keep
+          # the respin-suffix fallbacks in case a newer respin replaces it.
+          ok=0
+          for tag in "${GKI_TAG}" "${GKI_TAG/r1/r2}" "${GKI_TAG/r1/r3}" "${GKI_BRANCH}"; do
+            if git clone --depth=1 --single-branch --branch "${tag}" \
+                 https://android.googlesource.com/kernel/common "${KERNEL_DIR}" 2>/dev/null; then
+              echo "::notice::Cloned GKI ${tag}"
+              ok=1
+              break
+            fi
+          done
+          if [ "${ok}" != "1" ]; then
+            echo "::error::could not clone kernel/common from any candidate tag/branch"
+            exit 1
+          fi
+          cd "${KERNEL_DIR}"
+          echo "---- kernel version ----"
+          grep -E '^VERSION|^PATCHLEVEL|^SUBLEVEL|^EXTRAVERSION' Makefile
+
+      - name: Verify kernel version is 5.10.252
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          V=$(grep '^VERSION' Makefile | awk '{print $3}')
+          P=$(grep '^PATCHLEVEL' Makefile | awk '{print $3}')
+          S=$(grep '^SUBLEVEL' Makefile | awk '{print $3}')
+          FULL="${V}.${P}.${S}"
+          echo "Kernel version: ${FULL}"
+          if [ "${FULL}" != "${GKI_VERSION}" ]; then
+            echo "::error::Expected kernel ${GKI_VERSION} but got ${FULL}. The pinned GKI tag may have moved."
+            exit 1
+          fi
+          echo "::notice::Kernel version ${FULL} matches stock PixelOS (${GKI_VERSION})."
+
+      - name: Integrate KernelSU / KernelSU-Next / ReSukiSU
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          case "${{ inputs.manager }}" in
+            kernelsu-next)
+              setup_url="https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh"
+              setup_arg="next"
+              ;;
+            resukisu)
+              # ReSukiSU setup.sh clones ReSukiSU/ReSukiSU -> KernelSU/ itself
+              # and defaults to checking out its 'main' branch. No branch arg needed.
+              setup_url="https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh"
+              setup_arg=""
+              ;;
+            *)
+              setup_url="https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh"
+              setup_arg="main"
+              ;;
+          esac
+          curl -fsSL "${setup_url}" -o /tmp/manager-setup.sh
+          if [ -n "${setup_arg}" ]; then
+            bash /tmp/manager-setup.sh "${setup_arg}"
+          else
+            bash /tmp/manager-setup.sh
+          fi
+          ls -d KernelSU KernelSU-Next drivers/kernelsu 2>/dev/null || true
+
+      - name: Integrate external SUSFS (KernelSU-Next only; ReSukiSU has built-in SUSFS)
+        if: ${{ inputs.enable_susfs == true && inputs.manager == 'kernelsu-next' }}
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          git clone --depth=1 -b gki-android12-5.10 \
+            https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
+          patch -p1 --fuzz=3 < susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch
+          rsync -a susfs4ksu/kernel_patches/fs/ fs/
+          rsync -a susfs4ksu/kernel_patches/include/ include/
+
+      - name: Warn about SUSFS on plain kernelsu (not fatal)
+        if: ${{ inputs.enable_susfs == true && inputs.manager == 'kernelsu' }}
+        run: |
+          echo "::warning::tiann/KernelSU has no SUSFS support; ignoring enable_susfs and continuing."
+
+      - name: Configure kernel (pure GKI defconfig + KSU)
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          export PATH="${CLANG_BIN}:${PATH}"
+          export ARCH=arm64
+          # Pure GKI defconfig (no vendor fragments, no device dtb)
+          make O="${OUT_DIR}" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 CC=clang gki_defconfig
+          # Enable KernelSU (+ explicit kprobes/kallsyms it relies on; GKI has
+          # them by default but be explicit so the build never silently drops them).
+          scripts/config --file "${OUT_DIR}/.config" -e KSU
+          scripts/config --file "${OUT_DIR}/.config" -e KPROBES -e HAVE_KPROBES -e KPROBE_EVENTS -e KALLSYMS
+          # SUSFS only applies to kernelsu-next (external Simonpunk) and resukisu (built-in).
+          if [ "${{ inputs.enable_susfs }}" == "true" ] && \
+             { [ "${{ inputs.manager }}" == "kernelsu-next" ] || [ "${{ inputs.manager }}" == "resukisu" ]; }; then
+            scripts/config --file "${OUT_DIR}/.config" -e KSU_SUSFS
+            scripts/config --file "${OUT_DIR}/.config" \
+              -e KSU_SUSFS_SUS_PATH \
+              -e KSU_SUSFS_SUS_MOUNT \
+              -e KSU_SUSFS_SUS_KSTAT \
+              -e KSU_SUSFS_SPOOF_UNAME \
+              -e KSU_SUSFS_ENABLE_LOG \
+              -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+              -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+              -e KSU_SUSFS_OPEN_REDIRECT \
+              -e KSU_SUSFS_SUS_MAP
+          fi
+          # LTO selection
+          case "${{ inputs.lto }}" in
+            none) scripts/config --file "${OUT_DIR}/.config" -d LTO_CLANG -d LTO_CLANG_THIN -d LTO_CLANG_FULL -e LTO_NONE || true ;;
+            thin) scripts/config --file "${OUT_DIR}/.config" -d LTO_NONE -d LTO_CLANG_FULL -e LTO_CLANG -e LTO_CLANG_THIN || true ;;
+            full) scripts/config --file "${OUT_DIR}/.config" -d LTO_NONE -d LTO_CLANG_THIN -e LTO_CLANG -e LTO_CLANG_FULL || true ;;
+          esac
+          make O="${OUT_DIR}" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 CC=clang olddefconfig
+          echo "---- final config ----"
+          grep -E 'CONFIG_KSU|CONFIG_KPROBES|CONFIG_LTO|CONFIG_KSU_SUSFS|CONFIG_LOCALVERSION' "${OUT_DIR}/.config" || true
+
+      - name: Build GKI kernel (Image only — no dtb)
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          export PATH="${CLANG_BIN}:${PATH}"
+          export ARCH=arm64
+          if [ "${{ inputs.lto }}" == "thin" ]; then
+            mkdir -p "${OUT_DIR}"
+            printf '#!/bin/bash\nexec ld.lld "$@" --thinlto-jobs=2 --thinlto-cache-dir=/tmp/thinlto-cache\n' > "${OUT_DIR}/ld-thinlto-wrapper"
+            chmod +x "${OUT_DIR}/ld-thinlto-wrapper"
+            export LD="$(pwd)/${OUT_DIR}/ld-thinlto-wrapper"
+            export HOSTLD="$(pwd)/${OUT_DIR}/ld-thinlto-wrapper"
+          fi
+          make -j"${JOBS}" O="${OUT_DIR}" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 CC=clang \
+            KBUILD_BUILD_USER=marble KBUILD_BUILD_HOST=github-actions Image
+
+      - name: Verify built kernel version string
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          IMG="${OUT_DIR}/arch/arm64/boot/Image"
+          test -s "${IMG}" || { echo "::error::Image not built"; exit 1; }
+          echo "Image size: $(stat -c%s "${IMG}")"
+          strings "${IMG}" | grep -E -m2 'Linux version' || true
+          # Confirm it reports the GKI 5.10.252 base (not a vendor-tree 5.10.256)
+          strings "${IMG}" | grep -q "5.10.252" && echo "::notice::Image reports 5.10.252 (matches stock)." \
+            || echo "::warning::Image version string does not contain 5.10.252; double-check."
+
+      - name: Collect artifacts
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          mkdir -p release
+          cp "${OUT_DIR}/arch/arm64/boot/Image" release/Image
+          ls -lh release/
+
+      - name: Upload raw kernel Image
+        uses: actions/upload-artifact@v4
+        with:
+          name: GKI-Image
+          path: ${{ env.KERNEL_DIR }}/release/Image
+          if-no-files-found: error
