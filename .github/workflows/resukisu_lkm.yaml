@@ -47,9 +47,16 @@ on:
         type: string
         default: '38c6baf4bb72f783bb3588f9f1240603632a6c83'
       localversion:
-        description: 'Exact version suffix override, e.g. -gki-gb8f0c806 (or with -dirty). Set to the ROM kernel string seen in /proc/version AFTER 5.10.252 so vermagic matches exactly. Leave blank for auto git hash.'
+        description: 'Exact version suffix override, e.g. -gki-gf3f02401fb28 (or with -dirty). Set to the ROM kernel string seen in /proc/version AFTER 5.10.252 so vermagic matches exactly. REQUIRED in device-config mode for vendor modules to load. Leave blank for auto git hash.'
         type: string
         default: ''
+      config_source:
+        description: 'Kernel config base. device-config (recommended for PixelOS): use configs/pixelos_kernel.config (config extracted from your running ROM) so symbol CRCs match the ROM vendor_dlkm. fragments: gki_defconfig + waipio/xiaomi/marble/debugfs fragments.'
+        type: choice
+        default: 'device-config'
+        options:
+          - 'device-config'
+          - 'fragments'
       devicetrees:
         description: 'Device tree source (branch 16 contains goodix fp supply fix cea1f9d)'
         type: choice
@@ -226,19 +233,27 @@ jobs:
             commit -q -m "Integrate ReSukiSU as LKM"
           grep -n "kernelsu" drivers/Kconfig drivers/Makefile | head
 
-      - name: Configure kernel (gki_defconfig + vendor fragments + KSU=m)
+      - name: Configure kernel (base config + KSU=m)
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           export PATH="${LLVM_BIN}:${PATH}"
           export ARCH=arm64
           mkdir -p "${RELEASE_DIR}"
-          make O="${OUT_DIR}" ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang gki_defconfig
-          # Vendor fragments (aosp-pablo KernelSU-Next-marble marble preset)
-          ./scripts/kconfig/merge_config.sh -O "${OUT_DIR}" -m "${OUT_DIR}/.config" \
-            arch/arm64/configs/vendor/waipio_GKI.config \
-            arch/arm64/configs/vendor/xiaomi_GKI.config \
-            arch/arm64/configs/vendor/marble_GKI.config \
-            arch/arm64/configs/vendor/debugfs.config
+          if [ "${{ inputs.config_source }}" == "device-config" ]; then
+            # Use the config extracted from the running ROM (committed as
+            # configs/pixelos_kernel.config): same CONFIG_* values as the ROM
+            # kernel -> symbol CRCs match -> vendor_dlkm modules load.
+            cp ../configs/pixelos_kernel.config "${OUT_DIR}/.config"
+            echo "using device config: $(grep -cE '^CONFIG_' "${OUT_DIR}/.config") entries"
+          else
+            make O="${OUT_DIR}" ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang gki_defconfig
+            # Vendor fragments (aosp-pablo KernelSU-Next-marble marble preset)
+            ./scripts/kconfig/merge_config.sh -O "${OUT_DIR}" -m "${OUT_DIR}/.config" \
+              arch/arm64/configs/vendor/waipio_GKI.config \
+              arch/arm64/configs/vendor/xiaomi_GKI.config \
+              arch/arm64/configs/vendor/marble_GKI.config \
+              arch/arm64/configs/vendor/debugfs.config
+          fi
           # ReSukiSU as a loadable module (LKM), not built-in:
           scripts/config --file "${OUT_DIR}/.config" -m KSU
           # kprobes/kallsyms the LKM relies on (GKI has them; be explicit):
