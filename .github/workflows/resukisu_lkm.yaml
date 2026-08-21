@@ -252,6 +252,8 @@ jobs:
             export HOSTLD="$(pwd)/${OUT_DIR}/ld-thinlto-wrapper"
           fi
           # Image only (vmlinux + Module.symvers are produced alongside).
+          # modules_prepare generates scripts/module.lds, which external
+          # module (M=) builds need to link the final .ko.
           # The `dtbs` target is intentionally NOT built: the aosp-pablo
           # devicetrees repo includes <bindings/qcom,audio-ext-clk.h> whose
           # headers live at include/dt-bindings/clock/... in this kernel tree
@@ -260,7 +262,7 @@ jobs:
           # untouched anyway, and the ReSukiSU LKM does not need dtbs.
           make -j"${JOBS}" O="${OUT_DIR}" ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang \
             KBUILD_BUILD_USER=marble KBUILD_BUILD_HOST=github-actions \
-            Image 2>&1 | tee "${RELEASE_DIR}/build.log"
+            Image modules_prepare 2>&1 | tee "${RELEASE_DIR}/build.log"
 
       - name: Build ReSukiSU LKM (external module)
         working-directory: ${{ env.KERNEL_DIR }}
@@ -278,6 +280,15 @@ jobs:
             tee -a "${RELEASE_DIR}/build.log"
           echo "---- LKM candidates ----"
           find . -name 'kernelsu.ko' 2>/dev/null
+          # Optional but useful: ReSukiSU's check_symbol verifies every symbol
+          # the module uses is exported by vmlinux (catches missing EXPORTs).
+          if command -v cc >/dev/null 2>&1 && \
+             [ -f KernelSU/kernel/tools/check_symbol.c ] && [ -s "${OUT_DIR}/vmlinux" ]; then
+            cc KernelSU/kernel/tools/check_symbol.c -o /tmp/check_symbol
+            /tmp/check_symbol "KernelSU/kernel/kernelsu.ko" "${OUT_DIR}/vmlinux" \
+              && echo "check_symbol: OK" \
+              || echo "::warning::check_symbol reported unresolved symbols — review before flashing"
+          fi
 
       - name: Verify LKM and collect artifacts
         working-directory: ${{ env.KERNEL_DIR }}
