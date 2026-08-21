@@ -12,24 +12,30 @@ the kernel inside the `boot` partition**.
 **No kernel sources are stored here.** Everything (kernel tree, toolchain,
 root managers) is fetched at build time by the workflow.
 
-## Second workflow — ReSukiSU LKM (LineageOS-based)
+## Second workflow — rebuild ROM kernel with built-in root manager
 
-`.github/workflows/resukisu_lkm.yaml` follows the ROM author's approach
-(Telegram, 2026-06): build the marble kernel from **LineageOS
-`android_kernel_xiaomi_sm8450` @ `lineage-23.2`** (GKI 5.10 + QCOM vendor
-tree) + **aosp-pablo devicetrees @ `16`** (HEAD `cea1f9d`, goodix fp supply
-fix) + **`patches/0001-kk.patch`** (goodix_3626 fingerprint driver, applies
-cleanly to lineage-23.2), then build **ReSukiSU as a loadable LKM**
-(`CONFIG_KSU=m` → `kernelsu.ko`) instead of baking it into the kernel.
+`.github/workflows/resukisu_lkm.yaml` rebuilds the **PixelOS marble kernel** so
+the stock `vendor_dlkm` keeps loading while a fresh root manager is compiled
+in. Recipe (from the ROM author, Telegram 2026-06):
 
-- Defconfig: `gki_defconfig` + `vendor/{waipio,xiaomi,marble}_GKI.config` +
-  `vendor/debugfs.config` (mirrors aosp-pablo KernelSU-Next-marble preset).
-- Toolchain: `llvm-22.1.8` (aosp-pablo proven) or Android prebuilt clang.
-- Artifacts: `resukisu.ko` (LKM), `Image`, concatenated `dtb`.
-- ⚠️ Vermagic: the LKM only loads on a kernel with the same version string.
-  The workflow prints `kernel.release` + module vermagic — compare with the
-  device's `/proc/version`; on mismatch ask the ROM author for the exact
-  kernel HEAD, or flash the built `Image` together with the LKM.
+- Kernel: **LineageOS `android_kernel_xiaomi_sm8450` @ lineage-23.2**, pinned
+  to `38c6baf4bb72f783bb3588f9f1240603632a6c83` (SUBLEVEL 252 + vendor tree)
+- Devicetrees: aosp-pablo fork @ 16 (HEAD `cea1f9d`, goodix fp supply fix),
+  cloned as sibling (`sm8450-devicetrees`) — the tree's `vendor` dts dir is a
+  symlink to it
+- Patch: `patches/0001-kk.patch` (goodix_3626 fingerprint driver)
+- Config: **`configs/pixelos_kernel.config`** = `.config` extracted from the
+  running ROM (device-config mode). The ROM's old built-in KSU/SUSFS entries
+  (`CONFIG_KSU*`) are stripped, then the selected manager is enabled as
+  `CONFIG_KSU=y` (built-in): `kernelsu` (official tiann, default) /
+  `kernelsu-next` (optional Simonpunk SUSFS) / `resukisu`.
+- Version: the `localversion` input must be set to the ROM kernel suffix from
+  `/proc/version` (e.g. `-gki-gf3f02401fb28`) so vermagic matches vendor_dlkm.
+- Artifacts: `Image` (manager built in) + `goodix_3626.ko`.
+- The `dtbs` target is disabled (devicetrees audio dtsi headers mismatch the
+  kernel tree layout); stock vendor_boot DTB stays untouched when flashing.
+- ⚠️ Only vendor modules whose source/config match this build load. Flash the
+  original boot.img first to recover from any bad test.
 
 ## How to Build (GitHub Actions)
 
