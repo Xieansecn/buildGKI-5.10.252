@@ -418,6 +418,24 @@ jobs:
           find "${OUT_DIR}" -name 'goodix_3626.ko' -exec cp {} "${RELEASE_DIR}/goodix_3626.ko" \; 2>/dev/null || true
           ls -lh "${RELEASE_DIR}/"
 
+      - name: Package AnyKernel3 flashable zip (flash from recovery)
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -o pipefail
+          # osm0sis/AnyKernel3 template (ships magiskboot/busybox/ak3-core.sh),
+          # our anykernel.sh overlay + the built Image.
+          curl -fL --retry 3 -o /tmp/ak3.tar.gz \
+            "https://github.com/osm0sis/AnyKernel3/archive/refs/heads/master.tar.gz"
+          rm -rf /tmp/ak3src && mkdir -p /tmp/ak3src
+          tar -xzf /tmp/ak3.tar.gz -C /tmp/ak3src --strip-components=1
+          rm -f /tmp/ak3src/anykernel.sh /tmp/ak3src/README.md /tmp/ak3src/banner
+          cp ../ak3/anykernel.sh /tmp/ak3src/anykernel.sh
+          cp "${RELEASE_DIR}/Image" /tmp/ak3src/Image
+          ZIP_NAME="marble-$(echo "${{ inputs.manager }}" | sed 's/_/-/g')-$(date +%Y%m%d).zip"
+          (cd /tmp/ak3src && zip -r9 "${OLDPWD}/${RELEASE_DIR}/${ZIP_NAME}" . -x "*/.git/*" "*placeholder*")
+          ls -lh "${RELEASE_DIR}/${ZIP_NAME}"
+          echo "flashable zip: ${RELEASE_DIR}/${ZIP_NAME}"
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
