@@ -77,10 +77,11 @@ on:
           - 'thin'
           - 'full'
       manager:
-        description: 'Root manager built INTO the kernel (CONFIG_KSU=y). kernelsu = official tiann/KernelSU (works with official KernelSU Manager; no SUSFS). kernelsu-next = rifsxd/KernelSU-Next (needs KernelSU-Next Manager). resukisu = ReSukiSU (multi-manager + built-in SUSFS).'
+        description: 'Root manager built INTO the kernel (CONFIG_KSU=y). kernelsu = official tiann/KernelSU (works with official KernelSU Manager; no SUSFS). kernelsu-next = rifsxd/KernelSU-Next (needs KernelSU-Next Manager). resukisu = ReSukiSU (multi-manager + built-in SUSFS). none = no SU manager at all (baseline: verify the pure kernel replicates the ROM and boots before adding any manager).'
         type: choice
-        default: 'kernelsu'
+        default: 'none'
         options:
+          - 'none'
           - 'kernelsu'
           - 'kernelsu-next'
           - 'resukisu'
@@ -229,6 +230,7 @@ jobs:
           ls arch/arm64/boot/dts/vendor/qcom/marble* 2>/dev/null | head
 
       - name: Integrate root manager (in-tree, built into Image)
+        if: ${{ inputs.manager != 'none' }}
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           # Each manager's kernel/setup.sh clones the manager source into
@@ -306,8 +308,11 @@ jobs:
               arch/arm64/configs/vendor/marble_GKI.config \
               arch/arm64/configs/vendor/debugfs.config
           fi
-          # Root manager compiled INTO the kernel (built-in, not LKM):
-          scripts/config --file "${OUT_DIR}/.config" -e KSU
+          # Root manager compiled INTO the kernel (built-in, not LKM).
+          # manager=none: leave CONFIG_KSU absent — pure baseline kernel.
+          if [ "${{ inputs.manager }}" != "none" ]; then
+            scripts/config --file "${OUT_DIR}/.config" -e KSU
+          fi
           if [ "${{ inputs.enable_susfs }}" == "true" ] && \
              { [ "${{ inputs.manager }}" == "kernelsu-next" ] || [ "${{ inputs.manager }}" == "resukisu" ]; }; then
             scripts/config --file "${OUT_DIR}/.config" -e KSU_SUSFS
@@ -338,8 +343,14 @@ jobs:
             echo "::notice::Forced CONFIG_LOCALVERSION=${LV} (LOCALVERSION_AUTO off)"
           fi
           make O="${OUT_DIR}" ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang olddefconfig
-          grep -q '^CONFIG_KSU=y$' "${OUT_DIR}/.config" || {
-            echo "::error::CONFIG_KSU is not =y after olddefconfig (manager Kconfig not registered?)"; exit 1; }
+          if [ "${{ inputs.manager }}" == "none" ]; then
+            if grep -q '^CONFIG_KSU' "${OUT_DIR}/.config"; then
+              echo "::error::CONFIG_KSU still present with manager=none"; exit 1; fi
+            echo "baseline build: no CONFIG_KSU"
+          else
+            grep -q '^CONFIG_KSU=y$' "${OUT_DIR}/.config" || {
+              echo "::error::CONFIG_KSU is not =y after olddefconfig (manager Kconfig not registered?)"; exit 1; }
+          fi
           echo "---- final config ----"
           grep -E 'CONFIG_KSU|CONFIG_KPROBES|CONFIG_LTO|CONFIG_LOCALVERSION|CONFIG_FINGERPRINT' "${OUT_DIR}/.config" || true
 
@@ -394,8 +405,13 @@ jobs:
           test -s "${IMG}" || { echo "::error::Image not built"; exit 1; }
           echo "==== kernel release (must equal device /proc/version: 5.10.252-gki-gf3f02401fb28) ===="
           cat "${OUT_DIR}/include/config/kernel.release"
-          echo "==== root manager embedded in Image ===="
-          strings "${IMG}" | grep -iE -m3 'kernelsu|resukisu|KSU_VERSION' || true
+          if [ "${{ inputs.manager }}" != "none" ]; then
+            echo "==== root manager embedded in Image ===="
+            strings "${IMG}" | grep -iE -m3 'kernelsu|resukisu|KSU_VERSION' || true
+          else
+            echo "==== baseline: expecting NO KSU strings in Image ===="
+            strings "${IMG}" | grep -icE 'kernelsu' || true
+          fi
           echo "==== collect ===="
           mkdir -p "${RELEASE_DIR}"
           cp "${IMG}" "${RELEASE_DIR}/Image"
