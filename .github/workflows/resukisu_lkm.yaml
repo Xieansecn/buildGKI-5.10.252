@@ -127,7 +127,9 @@ jobs:
             echo "${LLVM_22_1_8_SHA256}  /tmp/llvm.tar.xz" | sha256sum -c -
             mkdir -p llvm
             tar -xJf /tmp/llvm.tar.xz -C llvm
-            LLVM_BIN="$(dirname "$(find llvm -name clang -path '*/bin/*' | head -1)")"
+            # realpath: later steps run from kernel_workspace/, so LLVM_BIN must
+            # be absolute or clang/ld.lld will not be found.
+            LLVM_BIN="$(realpath "$(dirname "$(find llvm -name clang -path '*/bin/*' | head -1)")")"
             test -x "${LLVM_BIN}/clang" && test -x "${LLVM_BIN}/ld.lld" || {
               echo "::error::LLVM 22.1.8 incomplete"; exit 1; }
             echo "LLVM_BIN=${LLVM_BIN}" >> "${GITHUB_ENV}"
