@@ -40,12 +40,12 @@ on:
         type: choice
         default: 'lineage-23.2'
         options:
-          - 'lineage-23.2'    # LineageOS lineage-23.2 pinned to android12-5.10.252_r00 merge (b8f0c806) + patches/0001-kk.patch
+          - 'lineage-23.2'    # LineageOS lineage-23.2 pinned to 38c6baf4bb72 (SUBLEVEL 252, vendor tree) + patches/0001-kk.patch
           - 'aosp-pablo-16'   # aosp-pablo fork branch 16 (goodix_3626 already merged)
       kernel_ref:
-        description: 'Kernel commit to pin (lineage preset default: b8f0c806173adf79691d019a1b23b92ecc3a4211 = 5.10.252). Leave blank for branch head.'
+        description: 'Kernel commit to pin. Default: 38c6baf4bb72 = lineage-23.2 device-branch merge (2026-03-20) with SUBLEVEL 252 + vendor tree (NOT b8f0c806 — that is the pure-GKI android12-5.10 branch commit without vendor files). Leave blank for branch head.'
         type: string
-        default: 'b8f0c806173adf79691d019a1b23b92ecc3a4211'
+        default: '38c6baf4bb72'
       localversion:
         description: 'Exact version suffix override, e.g. -gki-gb8f0c806 (or with -dirty). Set to the ROM kernel string seen in /proc/version AFTER 5.10.252 so vermagic matches exactly. Leave blank for auto git hash.'
         type: string
@@ -170,9 +170,11 @@ jobs:
               ;;
           esac
           cd "${KERNEL_DIR}"
-          # Pin to the ROM's exact kernel commit if provided:
-          # b8f0c806... = "Merge tag 'android12-5.10.252_r00'" (5.10.252,
-          # 2026-03-11) — the kernel base the ROM author builds from.
+          # Default pin 38c6baf4bb72 = lineage-23.2 device-branch merge
+          # (2026-03-20): SUBLEVEL 252 + full vendor tree (xiaomi_GKI.config,
+          # fingerprint drivers, ...). Do NOT use b8f0c806 (android12-5.10.252
+          # tag merge): that commit lives on the pure-GKI android12-5.10
+          # branch and has no vendor files, so the kk patch cannot apply.
           if [ -n "${{ inputs.kernel_ref }}" ]; then
             git fetch --depth=1 origin "${{ inputs.kernel_ref }}"
             git checkout -q "${{ inputs.kernel_ref }}"
