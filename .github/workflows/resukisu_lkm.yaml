@@ -230,12 +230,16 @@ jobs:
             full) scripts/config --file "${OUT_DIR}/.config" -d LTO_NONE -d LTO_CLANG_THIN -e LTO_CLANG -e LTO_CLANG_FULL || true ;;
           esac
           make O="${OUT_DIR}" ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang olddefconfig
+          grep -q '^CONFIG_KSU=m$' "${OUT_DIR}/.config" || {
+            echo "::error::CONFIG_KSU is not =m after olddefconfig (ReSukiSU Kconfig not registered?)"; exit 1; }
           echo "---- final config ----"
           grep -E 'CONFIG_KSU|CONFIG_KPROBES|CONFIG_LTO|CONFIG_LOCALVERSION|CONFIG_FINGERPRINT' "${OUT_DIR}/.config" || true
 
-      - name: Build kernel (Image + dtbs + modules)
+      - name: Build kernel (Image + dtbs)
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
+          # pipefail: without it `make ... | tee` hides a failing make (tee exits 0)
+          set -o pipefail
           export PATH="${LLVM_BIN}:${PATH}"
           export ARCH=arm64
           if [ "${{ inputs.lto }}" == "thin" ]; then
@@ -245,16 +249,36 @@ jobs:
             export LD="$(pwd)/${OUT_DIR}/ld-thinlto-wrapper"
             export HOSTLD="$(pwd)/${OUT_DIR}/ld-thinlto-wrapper"
           fi
-          # modules target also builds kernelsu.ko (CONFIG_KSU=m) + goodix_3626.ko
+          # Image only (vmlinux is produced alongside). The ReSukiSU LKM is
+          # built separately as an external module (next step), which avoids
+          # the in-tree drivers/kernelsu symlink + O=out pitfall.
           make -j"${JOBS}" O="${OUT_DIR}" ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang \
             KBUILD_BUILD_USER=marble KBUILD_BUILD_HOST=github-actions \
-            Image dtbs modules 2>&1 | tee "${RELEASE_DIR}/build.log"
+            Image dtbs 2>&1 | tee "${RELEASE_DIR}/build.log"
+
+      - name: Build ReSukiSU LKM (external module)
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -o pipefail
+          export PATH="${LLVM_BIN}:${PATH}"
+          export ARCH=arm64
+          # ReSukiSU documented flow: make -C <kernel> M=<ReSukiSU/kernel>
+          # src=<same> modules. kbuild prefers the module's Kbuild over its
+          # Makefile, so obj-$(CONFIG_KSU) += kernelsu.o is used; CONFIG_KSU=m
+          # comes from this tree's .config/auto.conf. Output lands in
+          # KernelSU/kernel/kernelsu.ko (or out/), found below.
+          make -C "${PWD}" O="${OUT_DIR}" ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang \
+            M="${PWD}/KernelSU/kernel" src="${PWD}/KernelSU/kernel" modules 2>&1 |
+            tee -a "${RELEASE_DIR}/build.log"
+          echo "---- LKM candidates ----"
+          find . -name 'kernelsu.ko' 2>/dev/null
 
       - name: Verify LKM and collect artifacts
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
-          KSU_KO="${OUT_DIR}/drivers/kernelsu/kernelsu.ko"
-          test -s "${KSU_KO}" || { echo "::error::kernelsu.ko not built"; exit 1; }
+          KSU_KO="$(find . -name 'kernelsu.ko' 2>/dev/null | head -1)"
+          test -n "${KSU_KO}" && test -s "${KSU_KO}" || {
+            echo "::error::kernelsu.ko not built"; exit 1; }
           echo "==== kernel release (compare with device /proc/version) ===="
           cat "${OUT_DIR}/include/config/kernel.release"
           echo "==== LKM vermagic (must equal the running kernel's version string) ===="
@@ -268,7 +292,6 @@ jobs:
             find "${OUT_DIR}/arch/arm64/boot/dts" -name '*.dtb' -exec cat {} + > "${RELEASE_DIR}/dtb"
             echo "dtb: $(stat -c%s "${RELEASE_DIR}/dtb") bytes from $(find "${OUT_DIR}/arch/arm64/boot/dts" -name '*.dtb' | wc -l) files"
           fi
-          find "${OUT_DIR}" -name 'goodix_3626.ko' -exec cp {} "${RELEASE_DIR}/" \; 2>/dev/null || true
           ls -lh "${RELEASE_DIR}/"
 
       - name: Upload artifacts
