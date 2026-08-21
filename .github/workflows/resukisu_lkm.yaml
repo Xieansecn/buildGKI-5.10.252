@@ -1,0 +1,277 @@
+# =====================================================================
+#  ReSukiSU LKM builder — LineageOS-based marble (Poco F5 / Redmi Note 12 Turbo)
+#
+#  Follows the ROM author's approach (Telegram, 2026-06):
+#    - Kernel source : LineageOS/android_kernel_xiaomi_sm8450 @ lineage-23.2
+#                      (GKI 5.10 + QCOM vendor tree; marble lives here)
+#    - Device tree   : aosp-pablo/android_kernel_xiaomi_sm8450-devicetrees @ 16
+#                      (branch 16 HEAD == cea1f9d "Fix goodix fingerprint supply name")
+#    - Patch         : patches/0001-kk.patch (adds goodix_3626 fingerprint driver)
+#    - Root manager  : ReSukiSU built as an LKM (CONFIG_KSU=m -> kernelsu.ko),
+#                      NOT compiled into the kernel image
+#
+#  Defconfig assembly mirrors the aosp-pablo KernelSU-Next-marble CI preset:
+#    gki_defconfig + vendor/waipio_GKI.config + vendor/xiaomi_GKI.config
+#                  + vendor/marble_GKI.config + vendor/debugfs.config
+#
+#  IMPORTANT — vermagic matching:
+#    An LKM only insmods on a kernel whose version string (vermagic) matches.
+#    This build prints the produced kernel.release + module vermagic; compare
+#    them with your device's /proc/version BEFORE flashing/loading. If they
+#    differ, the ROM's kernel was built from a different commit -> ask the ROM
+#    author for the exact kernel HEAD, or use the aosp-pablo-16 preset, or
+#    flash the built Image together with the LKM (then they always match).
+#
+#  Outputs (artifacts):
+#    - resukisu.ko  : ReSukiSU LKM (loadable, insmod / KernelSU manager)
+#    - Image        : the matching kernel image
+#    - dtb          : concatenated vendor DTBs (marble, from devicetrees repo)
+#    - build.log
+# =====================================================================
+name: build ReSukiSU LKM (LineageOS marble kernel)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_source:
+        description: 'Kernel source preset'
+        type: choice
+        default: 'lineage-23.2'
+        options:
+          - 'lineage-23.2'    # LineageOS lineage-23.2 + patches/0001-kk.patch (goodix_3626)
+          - 'aosp-pablo-16'   # aosp-pablo fork branch 16 (goodix_3626 already merged)
+      devicetrees:
+        description: 'Device tree source (branch 16 contains goodix fp supply fix cea1f9d)'
+        type: choice
+        default: 'aosp-pablo-16'
+        options:
+          - 'aosp-pablo-16'
+      toolchain:
+        description: 'Toolchain (llvm-22.1.8 = aosp-pablo proven combo)'
+        type: choice
+        default: 'llvm-22.1.8'
+        options:
+          - 'llvm-22.1.8'     # upstream LLVM release, no ncurses5 needed
+          - 'android-clang'   # official Android prebuilt clang-r547379
+      lto:
+        description: 'LTO mode (thin recommended on free runners)'
+        type: choice
+        default: 'thin'
+        options:
+          - 'none'
+          - 'thin'
+          - 'full'
+
+concurrency:
+  group: resukisu-lkm-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      KERNEL_DIR: kernel_workspace
+      OUT_DIR: out
+      RELEASE_DIR: release
+      JOBS: '2'
+      ARCH: arm64
+      # aosp-pablo KernelSU-Next-marble proven pin (config/marble.env)
+      LLVM_22_1_8_URL: https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-Linux-X64.tar.xz
+      LLVM_22_1_8_SHA256: df0e1ecf16caf3489a272a5eea4eec9b0d82878f6477fa309504f918a0006384
+      # Android prebuilt clang (fallback preset)
+      CLANG_VER: clang-r547379
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost || true
+
+      - name: Setup swap (needed for LTO)
+        if: ${{ inputs.lto != 'none' }}
+        uses: pierotofy/set-swap-space@v1.0
+        with:
+          swap-size-gb: 16
+
+      - name: Install dependencies (cached)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: >-
+            bc bison build-essential cpio curl flex git kmod
+            libelf-dev libncurses-dev libssl-dev file pahole
+            python3 python-is-python3 rsync unzip zip zstd xz-utils
+          version: 1.0
+
+      - name: Install legacy ncurses5 (Android prebuilt clang only)
+        if: ${{ inputs.toolchain == 'android-clang' }}
+        run: |
+          # Android's prebuilt clang.real links libncurses.so.5, missing on
+          # Ubuntu 24.04. Grab the jammy debs from the archive.
+          cd /tmp
+          wget -q https://archive.ubuntu.com/ubuntu/pool/universe/n/ncurses/libtinfo5_6.3-2ubuntu0.2_amd64.deb
+          wget -q https://archive.ubuntu.com/ubuntu/pool/universe/n/ncurses/libncurses5_6.3-2ubuntu0.2_amd64.deb
+          test -f libtinfo5_*.deb && test -f libncurses5_*.deb || {
+            echo "::error::failed to download ncurses5 debs"; exit 1; }
+          sudo dpkg -i libtinfo5_*.deb libncurses5_*.deb
+          sudo apt-get install -f -y
+
+      - name: Setup toolchain
+        run: |
+          if [ "${{ inputs.toolchain }}" == "llvm-22.1.8" ]; then
+            curl -fL --retry 3 -o /tmp/llvm.tar.xz "${LLVM_22_1_8_URL}"
+            echo "${LLVM_22_1_8_SHA256}  /tmp/llvm.tar.xz" | sha256sum -c -
+            mkdir -p llvm
+            tar -xJf /tmp/llvm.tar.xz -C llvm
+            LLVM_BIN="$(dirname "$(find llvm -name clang -path '*/bin/*' | head -1)")"
+            test -x "${LLVM_BIN}/clang" && test -x "${LLVM_BIN}/ld.lld" || {
+              echo "::error::LLVM 22.1.8 incomplete"; exit 1; }
+            echo "LLVM_BIN=${LLVM_BIN}" >> "${GITHUB_ENV}"
+            "${LLVM_BIN}/clang" --version
+          else
+            # Android official prebuilt clang (complete toolchain incl. ld.lld)
+            curl -fL --retry 3 \
+              "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VER}.tar.gz" \
+              -o /tmp/clang.tar.gz
+            mkdir -p clang
+            tar -xzf /tmp/clang.tar.gz -C clang
+            test -x clang/bin/clang && test -x clang/bin/ld.lld || {
+              echo "::error::android clang toolchain incomplete"; exit 1; }
+            echo "LLVM_BIN=$(pwd)/clang/bin" >> "${GITHUB_ENV}"
+            clang/bin/clang --version
+          fi
+
+      - name: Clone kernel source
+        run: |
+          case "${{ inputs.kernel_source }}" in
+            aosp-pablo-16)
+              git clone --depth=1 -b 16 \
+                https://github.com/aosp-pablo/android_kernel_xiaomi_sm8450 "${KERNEL_DIR}"
+              ;;
+            *)
+              git clone --depth=1 -b lineage-23.2 \
+                https://github.com/LineageOS/android_kernel_xiaomi_sm8450 "${KERNEL_DIR}"
+              ;;
+          esac
+          cd "${KERNEL_DIR}"
+          echo "---- kernel version ----"
+          grep -E '^VERSION|^PATCHLEVEL|^SUBLEVEL|^EXTRAVERSION' Makefile
+
+      - name: Apply goodix_3626 fingerprint patch (LineageOS preset only)
+        if: ${{ inputs.kernel_source == 'lineage-23.2' }}
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          # 0001-kk.patch adds drivers/input/fingerprint/goodix_3626 and
+          # CONFIG_FINGERPRINT_GOODIX_3626=m. Commit it so the tree stays clean
+          # (a dirty tree would append "-dirty" to the kernel/vermagic string).
+          git apply --check ../patches/0001-kk.patch
+          git apply ../patches/0001-kk.patch
+          git -c user.name="github-actions" -c user.email="actions@github.com" add -A
+          git -c user.name="github-actions" -c user.email="actions@github.com" \
+            commit -q -m "Apply goodix_3626 fingerprint driver (0001-kk.patch)"
+          ls -d drivers/input/fingerprint/goodix_3626
+
+      - name: Merge device tree (aosp-pablo sm8450-devicetrees @ 16)
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          # devicetrees repo layout (Makefile/qcom/bindings) maps directly onto
+          # arch/arm64/boot/dts/vendor/. Branch 16 HEAD == cea1f9d (goodix fp
+          # supply name fix for marble-sm7475).
+          git clone --depth=1 -b 16 \
+            https://github.com/aosp-pablo/android_kernel_xiaomi_sm8450-devicetrees /tmp/dtree
+          rsync -a /tmp/dtree/ arch/arm64/boot/dts/vendor/
+          test -f arch/arm64/boot/dts/vendor/qcom/marble-sm7475.dtsi || {
+            echo "::error::marble-sm7475.dtsi not found after merge"; exit 1; }
+          echo "merged devicetrees:"
+          ls arch/arm64/boot/dts/vendor/ | head
+
+      - name: Integrate ReSukiSU (in-tree hooks, build as LKM =m)
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          # ReSukiSU kernel/setup.sh clones ReSukiSU -> KernelSU/, symlinks
+          # drivers/kernelsu and registers CONFIG_KSU in the kernel Kconfig.
+          curl -fsSL https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh -o /tmp/rs-setup.sh
+          sh /tmp/rs-setup.sh
+          ls -d KernelSU drivers/kernelsu
+          # Ignore + commit the integration so the tree is not "-dirty":
+          echo "KernelSU/" >> .gitignore
+          git -c user.name="github-actions" -c user.email="actions@github.com" add -A
+          git -c user.name="github-actions" -c user.email="actions@github.com" \
+            commit -q -m "Integrate ReSukiSU as LKM"
+          grep -n "kernelsu" drivers/Kconfig drivers/Makefile | head
+
+      - name: Configure kernel (gki_defconfig + vendor fragments + KSU=m)
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          export PATH="${LLVM_BIN}:${PATH}"
+          export ARCH=arm64
+          mkdir -p "${RELEASE_DIR}"
+          make O="${OUT_DIR}" ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang gki_defconfig
+          # Vendor fragments (aosp-pablo KernelSU-Next-marble marble preset)
+          ./scripts/kconfig/merge_config.sh -O "${OUT_DIR}" -m "${OUT_DIR}/.config" \
+            arch/arm64/configs/vendor/waipio_GKI.config \
+            arch/arm64/configs/vendor/xiaomi_GKI.config \
+            arch/arm64/configs/vendor/marble_GKI.config \
+            arch/arm64/configs/vendor/debugfs.config
+          # ReSukiSU as a loadable module (LKM), not built-in:
+          scripts/config --file "${OUT_DIR}/.config" -m KSU
+          # kprobes/kallsyms the LKM relies on (GKI has them; be explicit):
+          scripts/config --file "${OUT_DIR}/.config" -e KPROBES -e HAVE_KPROBES -e KPROBE_EVENTS -e KALLSYMS
+          # LTO selection
+          case "${{ inputs.lto }}" in
+            none) scripts/config --file "${OUT_DIR}/.config" -d LTO_CLANG -d LTO_CLANG_THIN -d LTO_CLANG_FULL -e LTO_NONE || true ;;
+            thin) scripts/config --file "${OUT_DIR}/.config" -d LTO_NONE -d LTO_CLANG_FULL -e LTO_CLANG -e LTO_CLANG_THIN || true ;;
+            full) scripts/config --file "${OUT_DIR}/.config" -d LTO_NONE -d LTO_CLANG_THIN -e LTO_CLANG -e LTO_CLANG_FULL || true ;;
+          esac
+          make O="${OUT_DIR}" ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang olddefconfig
+          echo "---- final config ----"
+          grep -E 'CONFIG_KSU|CONFIG_KPROBES|CONFIG_LTO|CONFIG_LOCALVERSION|CONFIG_FINGERPRINT' "${OUT_DIR}/.config" || true
+
+      - name: Build kernel (Image + dtbs + modules)
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          export PATH="${LLVM_BIN}:${PATH}"
+          export ARCH=arm64
+          if [ "${{ inputs.lto }}" == "thin" ]; then
+            mkdir -p "${OUT_DIR}"
+            printf '#!/bin/bash\nexec ld.lld "$@" --thinlto-jobs=2 --thinlto-cache-dir=/tmp/thinlto-cache\n' > "${OUT_DIR}/ld-thinlto-wrapper"
+            chmod +x "${OUT_DIR}/ld-thinlto-wrapper"
+            export LD="$(pwd)/${OUT_DIR}/ld-thinlto-wrapper"
+            export HOSTLD="$(pwd)/${OUT_DIR}/ld-thinlto-wrapper"
+          fi
+          # modules target also builds kernelsu.ko (CONFIG_KSU=m) + goodix_3626.ko
+          make -j"${JOBS}" O="${OUT_DIR}" ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang \
+            KBUILD_BUILD_USER=marble KBUILD_BUILD_HOST=github-actions \
+            Image dtbs modules 2>&1 | tee "${RELEASE_DIR}/build.log"
+
+      - name: Verify LKM and collect artifacts
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          KSU_KO="${OUT_DIR}/drivers/kernelsu/kernelsu.ko"
+          test -s "${KSU_KO}" || { echo "::error::kernelsu.ko not built"; exit 1; }
+          echo "==== kernel release (compare with device /proc/version) ===="
+          cat "${OUT_DIR}/include/config/kernel.release"
+          echo "==== LKM vermagic (must equal the running kernel's version string) ===="
+          modinfo "${KSU_KO}" | grep -E '^(vermagic|filename|depends):'
+          strings "${KSU_KO}" | grep -E -m1 '^5\.10\.[0-9]+-gki' || true
+          echo "==== collect ===="
+          mkdir -p "${RELEASE_DIR}"
+          cp "${KSU_KO}" "${RELEASE_DIR}/resukisu.ko"
+          test -s "${OUT_DIR}/arch/arm64/boot/Image" && cp "${OUT_DIR}/arch/arm64/boot/Image" "${RELEASE_DIR}/Image"
+          if find "${OUT_DIR}/arch/arm64/boot/dts" -name '*.dtb' -print -quit | grep -q .; then
+            find "${OUT_DIR}/arch/arm64/boot/dts" -name '*.dtb' -exec cat {} + > "${RELEASE_DIR}/dtb"
+            echo "dtb: $(stat -c%s "${RELEASE_DIR}/dtb") bytes from $(find "${OUT_DIR}/arch/arm64/boot/dts" -name '*.dtb' | wc -l) files"
+          fi
+          find "${OUT_DIR}" -name 'goodix_3626.ko' -exec cp {} "${RELEASE_DIR}/" \; 2>/dev/null || true
+          ls -lh "${RELEASE_DIR}/"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReSukiSU-LKM-marble
+          path: ${{ env.KERNEL_DIR }}/${{ env.RELEASE_DIR }}/*
+          if-no-files-found: error

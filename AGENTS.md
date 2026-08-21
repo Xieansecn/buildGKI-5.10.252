@@ -12,6 +12,25 @@ the kernel inside the `boot` partition**.
 **No kernel sources are stored here.** Everything (kernel tree, toolchain,
 root managers) is fetched at build time by the workflow.
 
+## Second workflow — ReSukiSU LKM (LineageOS-based)
+
+`.github/workflows/resukisu_lkm.yaml` follows the ROM author's approach
+(Telegram, 2026-06): build the marble kernel from **LineageOS
+`android_kernel_xiaomi_sm8450` @ `lineage-23.2`** (GKI 5.10 + QCOM vendor
+tree) + **aosp-pablo devicetrees @ `16`** (HEAD `cea1f9d`, goodix fp supply
+fix) + **`patches/0001-kk.patch`** (goodix_3626 fingerprint driver, applies
+cleanly to lineage-23.2), then build **ReSukiSU as a loadable LKM**
+(`CONFIG_KSU=m` → `kernelsu.ko`) instead of baking it into the kernel.
+
+- Defconfig: `gki_defconfig` + `vendor/{waipio,xiaomi,marble}_GKI.config` +
+  `vendor/debugfs.config` (mirrors aosp-pablo KernelSU-Next-marble preset).
+- Toolchain: `llvm-22.1.8` (aosp-pablo proven) or Android prebuilt clang.
+- Artifacts: `resukisu.ko` (LKM), `Image`, concatenated `dtb`.
+- ⚠️ Vermagic: the LKM only loads on a kernel with the same version string.
+  The workflow prints `kernel.release` + module vermagic — compare with the
+  device's `/proc/version`; on mismatch ask the ROM author for the exact
+  kernel HEAD, or flash the built `Image` together with the LKM.
+
 ## How to Build (GitHub Actions)
 
 1. **Actions → build PixelOS GKI kernel (KernelSU/ReSukiSU) → Run workflow.**
