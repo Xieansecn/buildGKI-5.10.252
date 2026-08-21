@@ -43,9 +43,9 @@ on:
           - 'lineage-23.2'    # LineageOS lineage-23.2 pinned to 38c6baf4bb72 (SUBLEVEL 252, vendor tree) + patches/0001-kk.patch
           - 'aosp-pablo-16'   # aosp-pablo fork branch 16 (goodix_3626 already merged)
       kernel_ref:
-        description: 'Kernel commit to pin. Default: 38c6baf4bb72 = lineage-23.2 device-branch merge (2026-03-20) with SUBLEVEL 252 + vendor tree (NOT b8f0c806 — that is the pure-GKI android12-5.10 branch commit without vendor files). Leave blank for branch head.'
+        description: 'Kernel commit to pin — use the FULL 40-char SHA (abbreviated SHAs fail: "couldn''t find remote ref"). Default: 38c6baf4bb72f783bb3588f9f1240603632a6c83 = lineage-23.2 device-branch merge (2026-03-20), SUBLEVEL 252 + vendor tree (NOT b8f0c806, that is the pure-GKI branch without vendor files). Leave blank for branch head.'
         type: string
-        default: '38c6baf4bb72'
+        default: '38c6baf4bb72f783bb3588f9f1240603632a6c83'
       localversion:
         description: 'Exact version suffix override, e.g. -gki-gb8f0c806 (or with -dirty). Set to the ROM kernel string seen in /proc/version AFTER 5.10.252 so vermagic matches exactly. Leave blank for auto git hash.'
         type: string
