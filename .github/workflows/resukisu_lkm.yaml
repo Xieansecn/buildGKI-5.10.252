@@ -243,6 +243,7 @@ jobs:
             # Use the config extracted from the running ROM (committed as
             # configs/pixelos_kernel.config): same CONFIG_* values as the ROM
             # kernel -> symbol CRCs match -> vendor_dlkm modules load.
+            mkdir -p "${OUT_DIR}"
             cp ../configs/pixelos_kernel.config "${OUT_DIR}/.config"
             echo "using device config: $(grep -cE '^CONFIG_' "${OUT_DIR}/.config") entries"
           else
