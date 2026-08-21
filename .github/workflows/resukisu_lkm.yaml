@@ -25,7 +25,9 @@
 #  Outputs (artifacts):
 #    - resukisu.ko  : ReSukiSU LKM (loadable, insmod / KernelSU manager)
 #    - Image        : the matching kernel image
-#    - dtb          : concatenated vendor DTBs (marble, from devicetrees repo)
+#    - dtb          : optional; only if dtbs are ever built again (the `dtbs`
+#                     target is disabled — see the build step; stock vendor_boot
+#                     DTB is kept untouched when flashing)
 #    - build.log
 # =====================================================================
 name: build ReSukiSU LKM (LineageOS marble kernel)
@@ -235,7 +237,7 @@ jobs:
           echo "---- final config ----"
           grep -E 'CONFIG_KSU|CONFIG_KPROBES|CONFIG_LTO|CONFIG_LOCALVERSION|CONFIG_FINGERPRINT' "${OUT_DIR}/.config" || true
 
-      - name: Build kernel (Image + dtbs)
+      - name: Build kernel (Image)
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           # pipefail: without it `make ... | tee` hides a failing make (tee exits 0)
@@ -249,12 +251,16 @@ jobs:
             export LD="$(pwd)/${OUT_DIR}/ld-thinlto-wrapper"
             export HOSTLD="$(pwd)/${OUT_DIR}/ld-thinlto-wrapper"
           fi
-          # Image only (vmlinux is produced alongside). The ReSukiSU LKM is
-          # built separately as an external module (next step), which avoids
-          # the in-tree drivers/kernelsu symlink + O=out pitfall.
+          # Image only (vmlinux + Module.symvers are produced alongside).
+          # The `dtbs` target is intentionally NOT built: the aosp-pablo
+          # devicetrees repo includes <bindings/qcom,audio-ext-clk.h> whose
+          # headers live at include/dt-bindings/clock/... in this kernel tree
+          # (path layout mismatch), so the audio .dtbo build always fails.
+          # This is harmless: GKI flashing keeps the STOCK vendor_boot DTB
+          # untouched anyway, and the ReSukiSU LKM does not need dtbs.
           make -j"${JOBS}" O="${OUT_DIR}" ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang \
             KBUILD_BUILD_USER=marble KBUILD_BUILD_HOST=github-actions \
-            Image dtbs 2>&1 | tee "${RELEASE_DIR}/build.log"
+            Image 2>&1 | tee "${RELEASE_DIR}/build.log"
 
       - name: Build ReSukiSU LKM (external module)
         working-directory: ${{ env.KERNEL_DIR }}
