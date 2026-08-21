@@ -175,19 +175,19 @@ jobs:
             commit -q -m "Apply goodix_3626 fingerprint driver (0001-kk.patch)"
           ls -d drivers/input/fingerprint/goodix_3626
 
-      - name: Merge device tree (aosp-pablo sm8450-devicetrees @ 16)
+      - name: Checkout device tree (aosp-pablo sm8450-devicetrees @ 16)
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
-          # devicetrees repo layout (Makefile/qcom/bindings) maps directly onto
-          # arch/arm64/boot/dts/vendor/. Branch 16 HEAD == cea1f9d (goodix fp
+          # The kernel tree links arch/arm64/boot/dts/vendor ->
+          # ../../../../../sm8450-devicetrees, i.e. the devicetrees repo must
+          # live as a SIBLING of the kernel source dir (LineageOS convention,
+          # same as aosp-pablo's CI). Branch 16 HEAD == cea1f9d (goodix fp
           # supply name fix for marble-sm7475).
           git clone --depth=1 -b 16 \
-            https://github.com/aosp-pablo/android_kernel_xiaomi_sm8450-devicetrees /tmp/dtree
-          rsync -a /tmp/dtree/ arch/arm64/boot/dts/vendor/
+            https://github.com/aosp-pablo/android_kernel_xiaomi_sm8450-devicetrees ../sm8450-devicetrees
           test -f arch/arm64/boot/dts/vendor/qcom/marble-sm7475.dtsi || {
-            echo "::error::marble-sm7475.dtsi not found after merge"; exit 1; }
-          echo "merged devicetrees:"
-          ls arch/arm64/boot/dts/vendor/ | head
+            echo "::error::marble-sm7475.dtsi not found via vendor symlink"; exit 1; }
+          ls arch/arm64/boot/dts/vendor/qcom/marble* 2>/dev/null | head
 
       - name: Integrate ReSukiSU (in-tree hooks, build as LKM =m)
         working-directory: ${{ env.KERNEL_DIR }}
