@@ -1,36 +1,34 @@
 # =====================================================================
-#  ReSukiSU LKM builder — LineageOS-based marble (Poco F5 / Redmi Note 12 Turbo)
+#  marble kernel builder with built-in root manager — PixelOS-compatible
+#  (Poco F5 / Redmi Note 12 Turbo)
 #
-#  Follows the ROM author's approach (Telegram, 2026-06):
-#    - Kernel source : LineageOS/android_kernel_xiaomi_sm8450 @ lineage-23.2
-#                      (GKI 5.10 + QCOM vendor tree; marble lives here)
-#    - Device tree   : aosp-pablo/android_kernel_xiaomi_sm8450-devicetrees @ 16
-#                      (branch 16 HEAD == cea1f9d "Fix goodix fingerprint supply name")
-#    - Patch         : patches/0001-kk.patch (adds goodix_3626 fingerprint driver)
-#    - Root manager  : ReSukiSU built as an LKM (CONFIG_KSU=m -> kernelsu.ko),
-#                      NOT compiled into the kernel image
+#  Goal: rebuild the ROM's kernel (same source recipe + same config) with a
+#  NEW root manager compiled in, so the stock vendor_dlkm keeps loading
+#  (identical version string + identical symbol CRCs) while the kernel gains
+#  a fresh KernelSU / KernelSU-Next / ReSukiSU.
 #
-#  Defconfig assembly mirrors the aosp-pablo KernelSU-Next-marble CI preset:
-#    gki_defconfig + vendor/waipio_GKI.config + vendor/xiaomi_GKI.config
-#                  + vendor/marble_GKI.config + vendor/debugfs.config
+#  Kernel source recipe (ROM author, Telegram 2026-06):
+#    - Kernel : LineageOS/android_kernel_xiaomi_sm8450 @ lineage-23.2,
+#               pinned to 38c6baf4bb72 (SUBLEVEL 252, vendor tree)
+#    - Device tree : aosp-pablo/android_kernel_xiaomi_sm8450-devicetrees @ 16
+#                    (HEAD == cea1f9d "Fix goodix fingerprint supply name")
+#    - Patch  : patches/0001-kk.patch (adds goodix_3626 fingerprint driver)
+#    - Config : configs/pixelos_kernel.config = .config extracted from the
+#               running ROM (device-config mode) — keeps symbol CRCs identical
+#    - Version: localversion input forces the exact kernel version suffix
+#               (e.g. -gki-gf3f02401fb28) so vermagic matches vendor_dlkm
 #
-#  IMPORTANT — vermagic matching:
-#    An LKM only insmods on a kernel whose version string (vermagic) matches.
-#    This build prints the produced kernel.release + module vermagic; compare
-#    them with your device's /proc/version BEFORE flashing/loading. If they
-#    differ, the ROM's kernel was built from a different commit -> ask the ROM
-#    author for the exact kernel HEAD, or use the aosp-pablo-16 preset, or
-#    flash the built Image together with the LKM (then they always match).
+#  The ROM's own kernel already ships an (old) built-in KernelSU-Next+SUSFS;
+#  its CONFIG_KSU* entries are stripped from the config and replaced by the
+#  selected manager (default: official tiann/KernelSU, works with the
+#  official KernelSU Manager).
 #
 #  Outputs (artifacts):
-#    - resukisu.ko  : ReSukiSU LKM (loadable, insmod / KernelSU manager)
-#    - Image        : the matching kernel image
-#    - dtb          : optional; only if dtbs are ever built again (the `dtbs`
-#                     target is disabled — see the build step; stock vendor_boot
-#                     DTB is kept untouched when flashing)
+#    - Image               : kernel with the root manager compiled in
+#    - goodix_3626.ko      : fingerprint driver module (from the kk patch)
 #    - build.log
 # =====================================================================
-name: build ReSukiSU LKM (LineageOS marble kernel)
+name: build marble kernel (built-in KernelSU/KernelSU-Next/ReSukiSU)
 
 on:
   workflow_dispatch:
@@ -78,6 +76,18 @@ on:
           - 'none'
           - 'thin'
           - 'full'
+      manager:
+        description: 'Root manager built INTO the kernel (CONFIG_KSU=y). kernelsu = official tiann/KernelSU (works with official KernelSU Manager; no SUSFS). kernelsu-next = rifsxd/KernelSU-Next (needs KernelSU-Next Manager). resukisu = ReSukiSU (multi-manager + built-in SUSFS).'
+        type: choice
+        default: 'kernelsu'
+        options:
+          - 'kernelsu'
+          - 'kernelsu-next'
+          - 'resukisu'
+      enable_susfs:
+        description: 'Enable SUSFS (kernelsu-next via external Simonpunk patch, resukisu built-in; ignored for official kernelsu)'
+        type: boolean
+        default: false
 
 concurrency:
   group: resukisu-lkm-${{ github.ref }}
@@ -218,20 +228,57 @@ jobs:
             echo "::error::marble-sm7475.dtsi not found via vendor symlink"; exit 1; }
           ls arch/arm64/boot/dts/vendor/qcom/marble* 2>/dev/null | head
 
-      - name: Integrate ReSukiSU (in-tree hooks, build as LKM =m)
+      - name: Integrate root manager (in-tree, built into Image)
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
-          # ReSukiSU kernel/setup.sh clones ReSukiSU -> KernelSU/, symlinks
-          # drivers/kernelsu and registers CONFIG_KSU in the kernel Kconfig.
-          curl -fsSL https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh -o /tmp/rs-setup.sh
-          sh /tmp/rs-setup.sh
+          # Each manager's kernel/setup.sh clones the manager source into
+          # KernelSU/, symlinks drivers/kernelsu and registers CONFIG_KSU in
+          # the kernel Kconfig. The manager is compiled IN (CONFIG_KSU=y).
+          case "${{ inputs.manager }}" in
+            kernelsu-next)
+              setup_url="https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh"
+              setup_arg="next"
+              ;;
+            resukisu)
+              setup_url="https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh"
+              setup_arg=""
+              ;;
+            *)
+              setup_url="https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh"
+              setup_arg="main"
+              ;;
+          esac
+          curl -fsSL "${setup_url}" -o /tmp/manager-setup.sh
+          if [ -n "${setup_arg}" ]; then
+            bash /tmp/manager-setup.sh "${setup_arg}"
+          else
+            bash /tmp/manager-setup.sh
+          fi
           ls -d KernelSU drivers/kernelsu
           # Ignore + commit the integration so the tree is not "-dirty":
           echo "KernelSU/" >> .gitignore
           git -c user.name="github-actions" -c user.email="actions@github.com" add -A
           git -c user.name="github-actions" -c user.email="actions@github.com" \
-            commit -q -m "Integrate ReSukiSU as LKM"
+            commit -q -m "Integrate ${MANAGER} into kernel"
           grep -n "kernelsu" drivers/Kconfig drivers/Makefile | head
+
+      - name: Integrate external SUSFS (KernelSU-Next only; ReSukiSU has built-in SUSFS)
+        if: ${{ inputs.enable_susfs == true && inputs.manager == 'kernelsu-next' }}
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          git clone --depth=1 -b gki-android12-5.10 \
+            https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
+          patch -p1 --fuzz=3 < susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch
+          rsync -a susfs4ksu/kernel_patches/fs/ fs/
+          rsync -a susfs4ksu/kernel_patches/include/ include/
+          git -c user.name="github-actions" -c user.email="actions@github.com" add -A
+          git -c user.name="github-actions" -c user.email="actions@github.com" \
+            commit -q -m "Apply Simonpunk SUSFS patch"
+
+      - name: Warn about SUSFS on official kernelsu (not fatal)
+        if: ${{ inputs.enable_susfs == true && inputs.manager == 'kernelsu' }}
+        run: |
+          echo "::warning::tiann/KernelSU has no SUSFS support; ignoring enable_susfs and continuing."
 
       - name: Configure kernel (base config + KSU=m)
         working-directory: ${{ env.KERNEL_DIR }}
@@ -245,7 +292,11 @@ jobs:
             # kernel -> symbol CRCs match -> vendor_dlkm modules load.
             mkdir -p "${OUT_DIR}"
             cp ../configs/pixelos_kernel.config "${OUT_DIR}/.config"
-            echo "using device config: $(grep -cE '^CONFIG_' "${OUT_DIR}/.config") entries"
+            # Strip the ROM's built-in (old) KernelSU-Next + SUSFS entries:
+            # they belong to the old in-kernel manager and must not linger
+            # when we integrate the selected manager below.
+            sed -i '/^CONFIG_KSU/d' "${OUT_DIR}/.config"
+            echo "using device config: $(grep -cE '^CONFIG_' "${OUT_DIR}/.config") entries (KSU entries stripped)"
           else
             make O="${OUT_DIR}" ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang gki_defconfig
             # Vendor fragments (aosp-pablo KernelSU-Next-marble marble preset)
@@ -255,10 +306,22 @@ jobs:
               arch/arm64/configs/vendor/marble_GKI.config \
               arch/arm64/configs/vendor/debugfs.config
           fi
-          # ReSukiSU as a loadable module (LKM), not built-in:
-          scripts/config --file "${OUT_DIR}/.config" -m KSU
-          # kprobes/kallsyms the LKM relies on (GKI has them; be explicit):
+          # Root manager compiled INTO the kernel (built-in, not LKM):
+          scripts/config --file "${OUT_DIR}/.config" -e KSU
+          if [ "${{ inputs.enable_susfs }}" == "true" ] && \
+             { [ "${{ inputs.manager }}" == "kernelsu-next" ] || [ "${{ inputs.manager }}" == "resukisu" ]; }; then
+            scripts/config --file "${OUT_DIR}/.config" -e KSU_SUSFS
+            scripts/config --file "${OUT_DIR}/.config" \
+              -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT -e KSU_SUSFS_SUS_KSTAT \
+              -e KSU_SUSFS_SPOOF_UNAME -e KSU_SUSFS_ENABLE_LOG \
+              -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+              -e KSU_SUSFS_OPEN_REDIRECT -e KSU_SUSFS_SUS_MAP
+          fi
+          # kprobes/kallsyms the manager relies on (GKI has them; be explicit):
           scripts/config --file "${OUT_DIR}/.config" -e KPROBES -e HAVE_KPROBES -e KPROBE_EVENTS -e KALLSYMS
+          # goodix_3626 fingerprint driver (added by patches/0001-kk.patch).
+          # The device config predates it, so enable it explicitly as module:
+          scripts/config --file "${OUT_DIR}/.config" -m FINGERPRINT_GOODIX_3626
           # LTO selection
           case "${{ inputs.lto }}" in
             none) scripts/config --file "${OUT_DIR}/.config" -d LTO_CLANG -d LTO_CLANG_THIN -d LTO_CLANG_FULL -e LTO_NONE || true ;;
@@ -275,8 +338,8 @@ jobs:
             echo "::notice::Forced CONFIG_LOCALVERSION=${LV} (LOCALVERSION_AUTO off)"
           fi
           make O="${OUT_DIR}" ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang olddefconfig
-          grep -q '^CONFIG_KSU=m$' "${OUT_DIR}/.config" || {
-            echo "::error::CONFIG_KSU is not =m after olddefconfig (ReSukiSU Kconfig not registered?)"; exit 1; }
+          grep -q '^CONFIG_KSU=y$' "${OUT_DIR}/.config" || {
+            echo "::error::CONFIG_KSU is not =y after olddefconfig (manager Kconfig not registered?)"; exit 1; }
           echo "---- final config ----"
           grep -E 'CONFIG_KSU|CONFIG_KPROBES|CONFIG_LTO|CONFIG_LOCALVERSION|CONFIG_FINGERPRINT' "${OUT_DIR}/.config" || true
 
@@ -307,56 +370,41 @@ jobs:
             KBUILD_BUILD_USER=marble KBUILD_BUILD_HOST=github-actions \
             Image modules_prepare 2>&1 | tee "${RELEASE_DIR}/build.log"
 
-      - name: Build ReSukiSU LKM (external module)
+      - name: Build fingerprint module (goodix_3626)
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -o pipefail
           export PATH="${LLVM_BIN}:${PATH}"
           export ARCH=arm64
-          # ReSukiSU documented flow: make -C <kernel> M=<ReSukiSU/kernel>
-          # src=<same> modules. kbuild prefers the module's Kbuild over its
-          # Makefile, so obj-$(CONFIG_KSU) += kernelsu.o is used; CONFIG_KSU=m
-          # comes from this tree's .config/auto.conf. Output lands in
-          # KernelSU/kernel/kernelsu.ko (or out/), found below.
-          make -C "${PWD}" O="${OUT_DIR}" ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang \
-            M="${PWD}/KernelSU/kernel" src="${PWD}/KernelSU/kernel" modules 2>&1 |
-            tee -a "${RELEASE_DIR}/build.log"
-          echo "---- LKM candidates ----"
-          find . -name 'kernelsu.ko' 2>/dev/null
-          # Optional but useful: ReSukiSU's check_symbol verifies every symbol
-          # the module uses is exported by vmlinux (catches missing EXPORTs).
-          if command -v cc >/dev/null 2>&1 && \
-             [ -f KernelSU/kernel/tools/check_symbol.c ] && [ -s "${OUT_DIR}/vmlinux" ]; then
-            cc KernelSU/kernel/tools/check_symbol.c -o /tmp/check_symbol
-            /tmp/check_symbol "KernelSU/kernel/kernelsu.ko" "${OUT_DIR}/vmlinux" \
-              && echo "check_symbol: OK" \
-              || echo "::warning::check_symbol reported unresolved symbols — review before flashing"
+          if [ "${{ inputs.lto }}" == "thin" ]; then
+            export LD="$(pwd)/${OUT_DIR}/ld-thinlto-wrapper"
+            export HOSTLD="$(pwd)/${OUT_DIR}/ld-thinlto-wrapper"
           fi
+          # In-tree subdir build: compiles CONFIG_FINGERPRINT_GOODIX_3626=m
+          # (driver added by patches/0001-kk.patch) -> out/drivers/input/
+          # fingerprint/goodix_3626/goodix_3626.ko
+          make -j"${JOBS}" O="${OUT_DIR}" ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang \
+            drivers/input/fingerprint/goodix_3626/ 2>&1 | tee -a "${RELEASE_DIR}/build.log"
+          find "${OUT_DIR}" -name 'goodix_3626.ko' 2>/dev/null
 
-      - name: Verify LKM and collect artifacts
+      - name: Verify and collect artifacts
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
-          KSU_KO="$(find . -name 'kernelsu.ko' 2>/dev/null | head -1)"
-          test -n "${KSU_KO}" && test -s "${KSU_KO}" || {
-            echo "::error::kernelsu.ko not built"; exit 1; }
-          echo "==== kernel release (compare with device /proc/version) ===="
+          IMG="${OUT_DIR}/arch/arm64/boot/Image"
+          test -s "${IMG}" || { echo "::error::Image not built"; exit 1; }
+          echo "==== kernel release (must equal device /proc/version: 5.10.252-gki-gf3f02401fb28) ===="
           cat "${OUT_DIR}/include/config/kernel.release"
-          echo "==== LKM vermagic (must equal the running kernel's version string) ===="
-          modinfo "${KSU_KO}" | grep -E '^(vermagic|filename|depends):'
-          strings "${KSU_KO}" | grep -E -m1 '^5\.10\.[0-9]+-gki' || true
+          echo "==== root manager embedded in Image ===="
+          strings "${IMG}" | grep -iE -m3 'kernelsu|resukisu|KSU_VERSION' || true
           echo "==== collect ===="
           mkdir -p "${RELEASE_DIR}"
-          cp "${KSU_KO}" "${RELEASE_DIR}/resukisu.ko"
-          test -s "${OUT_DIR}/arch/arm64/boot/Image" && cp "${OUT_DIR}/arch/arm64/boot/Image" "${RELEASE_DIR}/Image"
-          if find "${OUT_DIR}/arch/arm64/boot/dts" -name '*.dtb' -print -quit | grep -q .; then
-            find "${OUT_DIR}/arch/arm64/boot/dts" -name '*.dtb' -exec cat {} + > "${RELEASE_DIR}/dtb"
-            echo "dtb: $(stat -c%s "${RELEASE_DIR}/dtb") bytes from $(find "${OUT_DIR}/arch/arm64/boot/dts" -name '*.dtb' | wc -l) files"
-          fi
+          cp "${IMG}" "${RELEASE_DIR}/Image"
+          find "${OUT_DIR}" -name 'goodix_3626.ko' -exec cp {} "${RELEASE_DIR}/goodix_3626.ko" \; 2>/dev/null || true
           ls -lh "${RELEASE_DIR}/"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ReSukiSU-LKM-marble
+          name: marble-kernel-ksu
           path: ${{ env.KERNEL_DIR }}/${{ env.RELEASE_DIR }}/*
           if-no-files-found: error
